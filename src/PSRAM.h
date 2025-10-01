@@ -1,7 +1,7 @@
 /*********************************************************************************
  *  MIT License
  *  
- *  Copyright (c) 2020-2024 Gregg E. Berman
+ *  Copyright (c) 2020-2025 Gregg E. Berman
  *  
  *  https://github.com/HomeSpan/HomeSpan
  *  
@@ -45,11 +45,14 @@ template <class T>
 struct Mallocator {
   typedef T value_type;
   Mallocator() = default;
-  template <class U> constexpr Mallocator(const Mallocator<U>&) noexcept {}
+  template <class U> constexpr Mallocator(const Mallocator<U>&) {}
   [[nodiscard]] T* allocate(std::size_t n) {
-    if(n > std::size_t(-1) / sizeof(T)) throw std::bad_alloc();
-    if(auto p = static_cast<T*>(HS_MALLOC(n*sizeof(T)))) return p;
-    throw std::bad_alloc();
+    auto p = static_cast<T*>(HS_MALLOC(n*sizeof(T)));
+    if(p==NULL){
+      Serial.printf("\n\n*** FATAL ERROR: Requested allocation of %d bytes failed.  Program Halting.\n\n",n*sizeof(T));
+      while(1);
+    }
+    return p;
   }
   void deallocate(T* p, std::size_t) noexcept { std::free(p); }
 };

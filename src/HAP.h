@@ -1,7 +1,7 @@
 /*********************************************************************************
  *  MIT License
  *  
- *  Copyright (c) 2020-2024 Gregg E. Berman
+ *  Copyright (c) 2020-2025 Gregg E. Berman
  *  
  *  https://github.com/HomeSpan/HomeSpan
  *  
@@ -34,7 +34,6 @@
 #include "HAPConstants.h"
 #include "HKDF.h"
 #include "SRP.h"
-#include "TLV8.h"
 
 const TLV8_names HAP_Names[] = {
   {kTLVType_Separator,"SEPARATOR"},
@@ -65,26 +64,6 @@ struct Nonce {
 };
 
 /////////////////////////////////////////////////
-// Paired Controller Structure for Permanently-Stored Data
-
-struct Controller {                
-  boolean allocated=false;                          // DEPRECATED (but needed for backwards compatability with original NVS storage of Controller info)
-  boolean admin;                                    // Controller has admin privileges
-  uint8_t ID[hap_controller_IDBYTES];               // Pairing ID
-  uint8_t LTPK[crypto_sign_PUBLICKEYBYTES];         // Long Term Ed2519 Public Key
-
-  Controller(){}
-  
-  Controller(uint8_t *id, uint8_t *ltpk, boolean ad){
-    allocated=true;
-    admin=ad;
-    memcpy(ID,id,hap_controller_IDBYTES);
-    memcpy(LTPK,ltpk,crypto_sign_PUBLICKEYBYTES);
-  }
-
-};
-
-/////////////////////////////////////////////////
 // Accessory Structure for Permanently-Stored Data
 
 struct Accessory {
@@ -105,27 +84,25 @@ struct HAPClient {
   static const int MAX_CONTROLLERS=16;                // maximum number of paired controllers (HAP requires at least 16)
   static const int MAX_ACCESSORIES=150;               // maximum number of allowed Accessories (HAP limit=150)
   
-  static nvs_handle hapNVS;                                         // handle for non-volatile-storage of HAP data
-  static nvs_handle srpNVS;                                         // handle for non-volatile-storage of SRP data
-  static HKDF hkdf;                                                 // generates (and stores) HKDF-SHA-512 32-byte keys derived from an inputKey of arbitrary length, a salt string, and an info string
   static pairState pairStatus;                                      // tracks pair-setup status
-  static SRP6A *srp;                                                // stores all SRP-6A keys used for Pair-Setup (must persist through multiple calls to Pair-Setup)
-  static Accessory accessory;                                       // Accessory ID and Ed25519 public and secret keys- permanently stored
+  static Accessory accessory;                                       // Accessory ID and Ed25519 public and secret keys - permanently stored
   static list<Controller, Mallocator<Controller>> controllerList;   // linked-list of Paired Controller IDs and ED25519 long-term public keys - permanently stored
-  static int conNum;                                                // connection number - used to keep track of per-connection EV notifications
 
   // individual structures and data defined for each Hap Client connection
   
-  WiFiClient client;              // handle to client
+  NetworkClient client;           // handle to client
+  int clientNumber;               // client number
   Controller *cPair=NULL;         // pointer to info on current, session-verified Paired Controller (NULL=un-verified, and therefore un-encrypted, connection)
    
   // These temporary Curve25519 keys are generated in the first call to pair-verify and used in the second call to pair-verify so must persist for a short period
-    
-  uint8_t *publicCurveKey;     // Accessory's Curve25519 Public Key
-  uint8_t *sharedCurveKey;     // Shared-Secret Curve25519 Key derived from Accessory's Secret Key and Controller's Public Key
-  uint8_t *sessionKey;         // Session Key Curve25519 (derived with various HKDF calls)
-  uint8_t *iosCurveKey;        // Controller's Curve25519 Public Key
 
+  struct tempKeys_t {
+    uint8_t publicCurveKey[crypto_box_PUBLICKEYBYTES];     // Accessory's Curve25519 Public Key
+    uint8_t sharedCurveKey[crypto_box_PUBLICKEYBYTES];     // Shared-Secret Curve25519 Key derived from Accessory's Secret Key and Controller's Public Key
+    uint8_t sessionKey[crypto_box_PUBLICKEYBYTES];         // Session Key Curve25519 (derived with various HKDF calls)
+    uint8_t iosCurveKey[crypto_box_PUBLICKEYBYTES];        // Controller's Curve25519 Public Key    
+  } temp;
+  
   // CurveKey and CurveKey Nonces are created once each new session is verified in /pair-verify.  Keys persist for as long as connection is open
   
   uint8_t a2cKey[32];             // AccessoryToControllerKey derived from HKDF-SHA-512 of sharedCurveKey (HAP Section 6.5.2)
@@ -155,9 +132,9 @@ struct HAPClient {
     
   static void init();            // initialize HAP after start-up
     
-  static void hexPrintColumn(uint8_t *buf, int n, int minLogLevel=0);     // prints 'n' bytes of *buf as HEX, one byte per row, subject to specified minimum log level
-  static void hexPrintRow(uint8_t *buf, int n, int minLogLevel=0);        // prints 'n' bytes of *buf as HEX, all on one row, subject to specified minimum log level
-  static void charPrintRow(uint8_t *buf, int n, int minLogLevel=0);       // prints 'n' bytes of *buf as CHAR, all on one row, subject to specified minimum log level
+  static void hexPrintColumn(const uint8_t *buf, int n, int minLogLevel=0);            // prints 'n' bytes of *buf as HEX, one byte per row, subject to specified minimum log level
+  static void hexPrintRow(const uint8_t *buf, int n, int minLogLevel=0);               // prints 'n' bytes of *buf as HEX, all on one row, subject to specified minimum log level
+  static void charPrintRow(const uint8_t *buf, int n, int minLogLevel=0);              // prints 'n' bytes of *buf as CHAR, all on one row, subject to specified minimum log level
   
   static Controller *findController(uint8_t *id);                                      // returns pointer to controller with matching ID (or NULL if no match)
   static tagError addController(uint8_t *id, uint8_t *ltpk, boolean admin);            // stores data for new Controller with specified data.  Returns tagError (if any)
@@ -168,9 +145,9 @@ struct HAPClient {
   static void tearDown(uint8_t *id);                                                   // tears down connections using Controller with ID=id; tears down all connections if id=NULL
   static void checkNotifications();                                                    // checks for Event Notifications and reports to controllers as needed (HAP Section 6.8)
   static void checkTimedWrites();                                                      // checks for expired Timed Write PIDs, and clears any found (HAP Section 6.7.2.4)
-  static void eventNotify(SpanBuf *pObj, int nObj, int ignoreClient=-1);               // transmits EVENT Notifications for nObj SpanBuf objects, pObj, with optional flag to ignore a specific client
+  static void eventNotify(SpanBufVec &pVec, HAPClient *ignore=NULL);                   // transmits EVENT Notifications for SpanBuf objects with optional flag to ignore a specific client
 
-  static void getStatusURL(HAPClient *, void (*)(const char *, void *), void *);       // GET / status (an optional, non-HAP feature)
+  static void getStatusURL(HAPClient *, void (*)(const char *, void *), void *, int refreshTime=0);       // GET / status (an optional, non-HAP feature)
 
   class HAPTLV : public TLV8 {   // dedicated class for HAP TLV8 records
     public:
@@ -231,5 +208,4 @@ class HapOut : public std::ostream {
 /////////////////////////////////////////////////
 // Extern Variables
 
-extern HAPClient **hap;
 extern HapOut hapOut;

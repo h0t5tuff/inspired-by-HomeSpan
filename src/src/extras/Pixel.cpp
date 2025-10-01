@@ -35,99 +35,133 @@
 //     Single-Wire RGB/RGBW NeoPixels     //
 ////////////////////////////////////////////
 
-Pixel::Pixel(int pin, boolean isRGBW){
+IRAM_ATTR size_t Pixel::pixelEncodeCallback(const void *colors, size_t symbolsTotal,
+                     size_t symbolsWritten, size_t symbolsFree,
+                     rmt_symbol_word_t *symbols, bool *done, void *arg) {
+
+  if(symbolsWritten==symbolsTotal){         // all symbols have been written
+    *done=true;
+    return(0);
+  } else {
+    *done=false;
+  }
+
+  callbackArgs_t *callbackArgs=(callbackArgs_t *)arg;
+  
+  if(symbolsFree < callbackArgs->pixel->symbolsPerPixel)         // not enough space to write an entire pixel
+    return(0);
+
+  Color *color = (Color *)colors + (callbackArgs->multiColor ? (symbolsWritten / callbackArgs->pixel->symbolsPerPixel) : 0);
+
+  for(auto i=0; i<callbackArgs->pixel->bytesPerPixel; i++){
+    uint8_t colorByte = color->col[callbackArgs->pixel->map[i]];
+    for(auto j = 7; j >= 0; j--)
+      *symbols++ = (colorByte & (1 << j)) ? callbackArgs->pixel->bit1 : callbackArgs->pixel->bit0;
+  }
+  
+  return(callbackArgs->pixel->symbolsPerPixel);
+};
+
+///////////////////
+
+Pixel::Pixel(int pin, const char *pixelType){
     
-  rf=new RFControl(pin,false,false);          // set clock to 1/80 usec, no default driver
-  if(!*rf)
+  this->pin=pin;
+
+  rmt_tx_channel_config_t tx_chan_config;
+  memset((void *)&tx_chan_config, 0, sizeof(rmt_tx_channel_config_t));
+  tx_chan_config.clk_src = RMT_CLK_SRC_DEFAULT;                       // always use 80MHz clock source
+  tx_chan_config.gpio_num = (gpio_num_t)pin;                          // GPIO number
+  tx_chan_config.mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL;   // set number of symbols to match those in a single channel block
+  tx_chan_config.resolution_hz = 80 * 1000 * 1000;                    // set to 80MHz
+  tx_chan_config.intr_priority = 3;                                   // medium interrupt priority
+  tx_chan_config.trans_queue_depth = 1;                               // set the number of transactions that can pend in the background
+  tx_chan_config.flags.invert_out = false;                            // do not invert output signal
+  tx_chan_config.flags.with_dma = false;                              // use RMT channel memory, not DMA (most chips do not support use of DMA anyway)
+  tx_chan_config.flags.io_loop_back = false;                          // do not use loop-back mode
+  tx_chan_config.flags.io_od_mode = false;                            // do not use open-drain output
+  
+  if(!GPIO_IS_VALID_OUTPUT_GPIO(pin)){
+    ESP_LOGE(PIXEL_TAG,"Can't create Pixel(%d) - invalid output pin",pin);
+    return;    
+  }
+
+  if(rmt_new_tx_channel(&tx_chan_config, &tx_chan)!=ESP_OK){
+    ESP_LOGE(PIXEL_TAG,"Can't create Pixel(%d) - no open channels",pin);
     return;
-
-  if(isRGBW)
-    this->lastBit=0;
-  else
-    this->lastBit=8;
+  }
   
-  setTiming(0.32, 0.88, 0.64, 0.56, 80.0);    // set default timing parameters (suitable for most SK68 and WS28 RGB pixels)
-
-  rmt_isr_register(loadData,NULL,0,NULL);               // set custom interrupt handler
+  bytesPerPixel=0;
+  size_t len=strlen(pixelType);
+  boolean invalidMap=false;
+  char v[]="RGBWC01234-";                                 // list of valid mapping characters for pixelType
   
-  rmt_set_tx_thr_intr_en(rf->getChannel(),false,8);     // disable threshold interrupt
-  txThrMask=RMT.int_ena.val;                            // save interrupt enable vector
-  rmt_set_tx_thr_intr_en(rf->getChannel(),true,8);      // enable threshold interrupt to trigger every 8 pulses 
-  txThrMask^=RMT.int_ena.val;                           // find bit that flipped and save as threshold mask for this channel 
+  for(int i=0;i<len && i<5;i++){                          // parse and then validate pixelType
+    int index=strchrnul(v,toupper(pixelType[i]))-v;
+    if(index==strlen(v))                                  // invalid mapping character found
+      invalidMap=true;
+    map[bytesPerPixel++]=index%5;                         // create pixel map and compute number of bytes per pixel
+  }
 
-  rmt_set_tx_intr_en(rf->getChannel(),false);           // disable end-of-transmission interrupt
-  txEndMask=RMT.int_ena.val;                            // save interrupt enable vector
-  rmt_set_tx_intr_en(rf->getChannel(),true);            // enable end-of-transmission interrupt
-  txEndMask^=RMT.int_ena.val;                           // find bit that flipped and save as end-of-transmission mask for this channel
+  if(bytesPerPixel<3 || len>5 || invalidMap){
+    ESP_LOGE(PIXEL_TAG,"Can't create Pixel(%d, \"%s\") - invalid pixelType",pin,pixelType);
+    return;
+  }
 
-  onColor.HSV(0,100,100,0);
+  symbolsPerPixel=bytesPerPixel*8;                        // pre-compute and store to save time in callback
+  sscanf(pixelType,"%ms",&pType);                         // save pixelType for later use with hasColor()
+  
+  rmt_enable(tx_chan);                                    // enable channel
+  channel=((int *)tx_chan)[0];                            // get channel number
+  
+  rmt_simple_encoder_config_t simple_config;              // create simple_encoder configuration  
+  simple_config.callback = pixelEncodeCallback;           // set callback function to encode data
+  simple_config.min_chunk_size=symbolsPerPixel;           // set minimum size to handle a full pixel
+  simple_config.arg = &callbackArgs;                      // set callback args  
+  rmt_new_simple_encoder(&simple_config, &encoder);       // create simple_encoder using above configuration
+
+  callbackArgs.pixel=this;                                // set callback arg to point back to this pixel instance   
+  setTiming(0.32, 0.88, 0.64, 0.56, 80.0);                // set default timing parameters (suitable for most SK68 and WS28 RGB pixels)
+  onColor.HSV(0,100,100,0);                               // set onColor
 }
 
 ///////////////////
 
-void Pixel::setTiming(float high0, float low0, float high1, float low1, uint32_t lowReset){
+Pixel *Pixel::setTiming(float high0, float low0, float high1, float low1, uint32_t lowReset){
+
+  if(channel<0)
+    return(this);
   
-  pattern[0]=RF_PULSE(high0*80+0.5,low0*80+0.5);
-  pattern[1]=RF_PULSE(high1*80+0.5,low1*80+0.5);
+  bit0.level0=1;
+  bit0.duration0=high0*80+0.5;
+  bit0.level1=0;
+  bit0.duration1=low0*80+0.5;
+  
+  bit1.level0=1;
+  bit1.duration0=high1*80+0.5;
+  bit1.level1=0;
+  bit1.duration1=low1*80+0.5;
+
   resetTime=lowReset;
+  return(this);
 }
 
 ///////////////////
 
-void Pixel::set(Color *c, int nPixels, boolean multiColor){
-  
-  if(!*rf || nPixels==0)
+void Pixel::set(Color *c, size_t nPixels, boolean multiColor){
+
+  if(channel<0 || nPixels==0)
     return;
 
-  status.nPixels=nPixels;
-  status.color=c;
-  status.iMem=0;
-  status.iBit=32;
-  status.started=true;
-  status.px=this;
-  status.multiColor=multiColor;
+  rmt_ll_set_group_clock_src(&RMT, channel, RMT_CLK_SRC_DEFAULT, 1, 0, 0);    // ensure use of DEFAULT CLOCK, which is always 80 MHz, without any scaling
 
-  loadData(this);         // load first two bytes of data to get started
-  loadData(this);
+  callbackArgs.multiColor = multiColor;
+  rmt_transmit_config_t tx_config{};
 
-  rmt_tx_start(rf->getChannel(),true);
-
-  while(status.started);            // wait for transmission to be complete
-  delayMicroseconds(resetTime);     // end-of-marker delay
+  rmt_transmit(tx_chan, encoder, c, nPixels*symbolsPerPixel, &tx_config);     // transmit data (size parameter set to total number of symbols to be written)
+  rmt_tx_wait_all_done(tx_chan,-1);                                           // wait until final data is transmitted
+  delayMicroseconds(resetTime);                                               // end-of-marker delay
 }
-
-///////////////////
-
-void IRAM_ATTR Pixel::loadData(void *arg){
-
-  if(RMT.int_st.val & status.px->txEndMask){
-    RMT.int_clr.val=status.px->txEndMask;
-    status.started=false;
-    return;
-  }
-  
-  RMT.int_clr.val=status.px->txThrMask;       // if loadData() is called and it is NOT because of an END interrupt (above) then must either be a pre-load, or a threshold trigger
-
-  if(status.nPixels==0){
-    RMTMEM.chan[status.px->rf->getChannel()].data32[status.iMem].val=0;
-    return;
-  }
-  
-  for(int i=0;i<8;i++)
-    RMTMEM.chan[status.px->rf->getChannel()].data32[status.iMem++].val=status.px->pattern[(status.color->val>>(--status.iBit))&1];
-    
-  if(status.iBit==status.px->lastBit){
-    status.iBit=32;
-    status.color+=status.multiColor;
-    status.nPixels--;    
-  }
-  
-  status.iMem%=status.px->memSize;    
-}
-
-///////////////////
-
-volatile Pixel::pixel_status_t Pixel::status;
 
 ////////////////////////////////////////////
 //          Two-Wire RGB DotStars         //
@@ -143,34 +177,32 @@ Dot::Dot(uint8_t dataPin, uint8_t clockPin){
   dataMask=1<<(dataPin%32);
   clockMask=1<<(clockPin%32);
 
-#ifdef CONFIG_IDF_TARGET_ESP32C3
-  dataSetReg=&GPIO.out_w1ts.val;
-  dataClearReg=&GPIO.out_w1tc.val;
-  clockSetReg=&GPIO.out_w1ts.val;
-  clockClearReg=&GPIO.out_w1tc.val;
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+  #define OUT_W1TS  &GPIO.out_w1ts.val
+  #define OUT_W1TC  &GPIO.out_w1tc.val
+  #define OUT1_W1TS  NULL
+  #define OUT1_W1TC  NULL
+#elif defined(CONFIG_IDF_TARGET_ESP32C6)
+  #define OUT_W1TS  &GPIO.out_w1ts.val
+  #define OUT_W1TC  &GPIO.out_w1tc.val
+  #define OUT1_W1TS  &GPIO.out1_w1ts.val
+  #define OUT1_W1TC  &GPIO.out1_w1tc.val
 #else
-  if(dataPin<32){
-    dataSetReg=&GPIO.out_w1ts;
-    dataClearReg=&GPIO.out_w1tc;
-  } else {
-    dataSetReg=&GPIO.out1_w1ts.val;
-    dataClearReg=&GPIO.out1_w1tc.val;    
-  }
-
-  if(clockPin<32){
-    clockSetReg=&GPIO.out_w1ts;
-    clockClearReg=&GPIO.out_w1tc;
-  } else {
-    clockSetReg=&GPIO.out1_w1ts.val;
-    clockClearReg=&GPIO.out1_w1tc.val;    
-  }
+  #define OUT_W1TS  &GPIO.out_w1ts
+  #define OUT_W1TC  &GPIO.out_w1tc
+  #define OUT1_W1TS  &GPIO.out1_w1ts.val
+  #define OUT1_W1TC  &GPIO.out1_w1tc.val
 #endif
 
+  dataSetReg=     dataPin<32 ? (OUT_W1TS) : (OUT1_W1TS);
+  dataClearReg=   dataPin<32 ? (OUT_W1TC) : (OUT1_W1TC);
+  clockSetReg=    clockPin<32 ? (OUT_W1TS) : (OUT1_W1TS);
+  clockClearReg=  clockPin<32 ? (OUT_W1TC) : (OUT1_W1TC);
 }
 
 ///////////////////
 
-void Dot::set(Color *c, int nPixels, boolean multiColor){
+void Dot::set(Color *c, size_t nPixels, boolean multiColor){
   
   *dataClearReg=dataMask;           // send all zeros
   for(int j=0;j<31;j++){

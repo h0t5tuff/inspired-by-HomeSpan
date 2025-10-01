@@ -1,7 +1,7 @@
 /*********************************************************************************
  *  MIT License
  *  
- *  Copyright (c) 2020-2024 Gregg E. Berman
+ *  Copyright (c) 2020-2025 Gregg E. Berman
  *  
  *  https://github.com/HomeSpan/HomeSpan
  *  
@@ -24,6 +24,8 @@
  *  SOFTWARE.
  *  
  ********************************************************************************/
+
+#include "version.h"
  
 #include <ESPmDNS.h>
 #include <sodium.h>
@@ -38,9 +40,6 @@ void HAPClient::init(){
 
   size_t len;                                   // not used but required to read blobs from NVS
 
-  nvs_open("SRP",NVS_READWRITE,&srpNVS);        // open SRP data namespace in NVS 
-  nvs_open("HAP",NVS_READWRITE,&hapNVS);        // open HAP data namespace in NVS
-
   if(strlen(homeSpan.spanOTA.otaPwd)==0){                                 // OTA password has not been specified in sketch
     if(!nvs_get_str(homeSpan.otaNVS,"OTADATA",NULL,&len)){                // if found OTA data in NVS...
     nvs_get_str(homeSpan.otaNVS,"OTADATA",homeSpan.spanOTA.otaPwd,&len);  // ...retrieve data.
@@ -49,19 +48,19 @@ void HAPClient::init(){
     }
   }
   
-  if(nvs_get_blob(srpNVS,"VERIFYDATA",NULL,&len))                         // if Pair-Setup verification code data not found in NVS
-    homeSpan.setPairingCode(DEFAULT_SETUP_CODE);                          // create and save verification from using Pairing Setup Code
-
-  if(!strlen(homeSpan.qrID)){                                             // is Setup ID has not been specified in sketch
-    if(!nvs_get_str(hapNVS,"SETUPID",NULL,&len)){                         // check for saved value
-      nvs_get_str(hapNVS,"SETUPID",homeSpan.qrID,&len);                   // retrieve data
+  if(!strlen(homeSpan.qrID)){                                             // if Setup ID has not been specified in sketch
+    if(!nvs_get_str(homeSpan.hapNVS,"SETUPID",NULL,&len)){                // check for saved value
+      nvs_get_str(homeSpan.hapNVS,"SETUPID",homeSpan.qrID,&len);          // retrieve data
     } else {
       sprintf(homeSpan.qrID,"%s",DEFAULT_QR_ID);                          // use default
    }
   }
+
+  if(nvs_get_blob(homeSpan.srpNVS,"VERIFYDATA",NULL,&len))                // if Pair-Setup verification code data not found in NVS
+    homeSpan.setPairingCode(DEFAULT_SETUP_CODE,false);                    // create and save verification from default Pairing Setup Code 
   
-  if(!nvs_get_blob(hapNVS,"ACCESSORY",NULL,&len)){                        // if found long-term Accessory data in NVS
-    nvs_get_blob(hapNVS,"ACCESSORY",&accessory,&len);                     // retrieve data
+  if(!nvs_get_blob(homeSpan.hapNVS,"ACCESSORY",NULL,&len)){               // if found long-term Accessory data in NVS
+    nvs_get_blob(homeSpan.hapNVS,"ACCESSORY",&accessory,&len);            // retrieve data
   } else {      
     LOG0("Generating new random Accessory ID and Long-Term Ed25519 Signature Keys...\n\n");
     uint8_t buf[6];
@@ -74,13 +73,13 @@ void HAPClient::init(){
     memcpy(accessory.ID,cBuf,17);                                        // copy into Accessory ID for permanent storage
     crypto_sign_keypair(accessory.LTPK,accessory.LTSK);                  // generate new random set of keys using libsodium public-key signature
     
-    nvs_set_blob(hapNVS,"ACCESSORY",&accessory,sizeof(accessory));       // update data
-    nvs_commit(hapNVS);                                                  // commit to NVS
+    nvs_set_blob(homeSpan.hapNVS,"ACCESSORY",&accessory,sizeof(accessory));       // update data
+    nvs_commit(homeSpan.hapNVS);                                                  // commit to NVS
   }
 
-  if(!nvs_get_blob(hapNVS,"CONTROLLERS",NULL,&len)){                     // if found long-term Controller Pairings data from NVS
+  if(!nvs_get_blob(homeSpan.hapNVS,"CONTROLLERS",NULL,&len)){            // if found long-term Controller Pairings data from NVS
     TempBuffer<Controller> tBuf(len/sizeof(Controller));
-    nvs_get_blob(hapNVS,"CONTROLLERS",tBuf,&len);                        // retrieve data
+    nvs_get_blob(homeSpan.hapNVS,"CONTROLLERS",tBuf,&len);               // retrieve data
     for(int i=0;i<tBuf.size();i++){
       if(tBuf[i].allocated)
         controllerList.push_back(tBuf[i]);
@@ -95,12 +94,12 @@ void HAPClient::init(){
 
   printControllers();                                                         
 
-  if(!nvs_get_blob(hapNVS,"HAPHASH",NULL,&len)){                 // if found HAP HASH structure
-    nvs_get_blob(hapNVS,"HAPHASH",&homeSpan.hapConfig,&len);     // retrieve data    
+  if(!nvs_get_blob(homeSpan.hapNVS,"HAPHASH",NULL,&len)){                 // if found HAP HASH structure
+    nvs_get_blob(homeSpan.hapNVS,"HAPHASH",&homeSpan.hapConfig,&len);     // retrieve data    
   } else {
     LOG0("Resetting Database Hash...\n");
-    nvs_set_blob(hapNVS,"HAPHASH",&homeSpan.hapConfig,sizeof(homeSpan.hapConfig));     // save data (will default to all zero values, which will then be updated below)
-    nvs_commit(hapNVS);                                                                // commit to NVS
+    nvs_set_blob(homeSpan.hapNVS,"HAPHASH",&homeSpan.hapConfig,sizeof(homeSpan.hapConfig));     // save data (will default to all zero values, which will then be updated below)
+    nvs_commit(homeSpan.hapNVS);                                                                // commit to NVS
   }
 
   if(homeSpan.updateDatabase(false)){       // create Configuration Number and Loop vector
@@ -234,6 +233,8 @@ void HAPClient::processRequest(){
   } // PUT request           
       
   if(!strncmp(body,"GET ",4)){                                                                                         // this is a GET request
+
+    int refreshTime;
                     
     if(!strncmp(body,"GET /accessories ",17))                                                                          // GET ACCESSORIES
       getAccessoriesURL();
@@ -241,8 +242,8 @@ void HAPClient::processRequest(){
     else if(!strncmp(body,"GET /characteristics?",21))                                                                 // GET CHARACTERISTICS
       getCharacteristicsURL(body+21);
 
-    else if(homeSpan.webLog.isEnabled && !strncmp(body,homeSpan.webLog.statusURL.c_str(),homeSpan.webLog.statusURL.length()))       // GET STATUS - AN OPTIONAL, NON-HAP-R2 FEATURE
-      getStatusURL(this,NULL,NULL);
+    else if(homeSpan.webLog.isEnabled && (refreshTime=homeSpan.webLog.check(body+4))>=0)                               // OPTIONAL (NON-HAP) STATUS REQUEST
+      getStatusURL(this,NULL,NULL,refreshTime);
 
     else {
       notFoundError();
@@ -316,6 +317,8 @@ int HAPClient::unauthorizedError(){
 
 int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
 
+  static SRP6A *srp=NULL;   // must persist across multiple calls to postPairSetupURL
+
   HAPTLV iosTLV;
   HAPTLV responseTLV;
   HAPTLV subTLV;
@@ -325,7 +328,7 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
     iosTLV.print();
   LOG2("------------ END TLVS! ------------\n");
 
-  LOG1("In Pair Setup #%d (%s)...",conNum,client.remoteIP().toString().c_str());
+  LOG1("In Pair Setup #%d (%s)...",clientNumber,client.remoteIP().toString().c_str());
   
   auto itState=iosTLV.find(kTLVType_State);
 
@@ -335,7 +338,7 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
     return(0);
   }
 
-  int tlvState=(*itState)[0];
+  int tlvState=itState->getVal();
 
   if(nAdminControllers()){                                  // error: Device already paired (i.e. there is at least one admin Controller). We should not be receiving any requests for Pair-Setup!
     LOG0("\n*** ERROR: Device already paired!\n\n");
@@ -345,7 +348,7 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
     return(0);
   };
 
-  LOG2("Found <M%d>.  Expected <M%d>.\n",tlvState,pairStatus);
+  LOG1("Found <M%d>.  Expected <M%d>.\n",tlvState,pairStatus);
 
   if(tlvState!=pairStatus){                                         // error: Device is not yet paired, but out-of-sequence pair-setup STATE was received
     LOG0("\n*** ERROR: Out-of-Sequence Pair-Setup request!\n\n");
@@ -364,7 +367,7 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
 
       auto itMethod=iosTLV.find(kTLVType_Method);
 
-      if(iosTLV.len(itMethod)!=1 || (*itMethod)[0]!=0){                         // error: "Pair Setup" method must always be 0 to indicate setup without MiFi Authentification (HAP Table 5-3)
+      if(iosTLV.len(itMethod)!=1 || itMethod->getVal()!=0){                     // error: "Pair Setup" method must always be 0 to indicate setup without MiFi Authentification (HAP Table 5-3)
         LOG0("\n*** ERROR: Pair 'Method' missing or not set to 0\n\n");
         responseTLV.add(kTLVType_Error,tagError_Unavailable);                   // set Error=Unavailable
         tlvRespond(responseTLV);                                                // send response to client
@@ -378,7 +381,7 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
         
       TempBuffer<Verification> verifyData;                                          // retrieve verification data (should already be stored in NVS)
       size_t len=verifyData.len();
-      nvs_get_blob(srpNVS,"VERIFYDATA",verifyData,&len);
+      nvs_get_blob(homeSpan.srpNVS,"VERIFYDATA",verifyData,&len);
 
       responseTLV.add(kTLVType_Salt,16,verifyData.get()->salt);                     // write Salt from verification data into TLV
       
@@ -405,7 +408,7 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
         return(0);
       };
 
-      srp->createSessionKey(*itPublicKey,(*itPublicKey).len);                 // create session key, K, from client Public Key, A
+      srp->createSessionKey(*itPublicKey,itPublicKey->getLen());              // create session key, K, from client Public Key, A
 
       if(!srp->verifyClientProof(*itClientProof)){                            // verify client Proof, M1
         LOG0("\n*** ERROR: SRP Proof Verification Failed\n\n");
@@ -448,16 +451,15 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
       // Note the SALT and INFO text fields used by HKDF to create this Session Key are NOT the same as those for creating iosDeviceX.
       // The iosDeviceX HKDF calculations are separate and will be performed further below with the SALT and INFO as specified in the HAP docs.
 
-      TempBuffer<uint8_t> sessionKey(crypto_box_PUBLICKEYBYTES);                                            // temporary space - used only in this block     
-      hkdf.create(sessionKey,srp->K,64,"Pair-Setup-Encrypt-Salt","Pair-Setup-Encrypt-Info");                // create SessionKey
+      HKDF::create(temp.sessionKey,srp->K,64,"Pair-Setup-Encrypt-Salt","Pair-Setup-Encrypt-Info");               // create SessionKey
 
       LOG2("------- DECRYPTING SUB-TLVS -------\n");
       
       // use SessionKey to decrypt encryptedData TLV with padded nonce="PS-Msg05"
                                   
-      TempBuffer<uint8_t> decrypted((*itEncryptedData).len-crypto_aead_chacha20poly1305_IETF_ABYTES);       // temporary storage for decrypted data
+      TempBuffer<uint8_t> decrypted(itEncryptedData->getLen()-crypto_aead_chacha20poly1305_IETF_ABYTES);  // temporary storage for decrypted data
        
-      if(crypto_aead_chacha20poly1305_ietf_decrypt(decrypted, NULL, NULL, *itEncryptedData, (*itEncryptedData).len, NULL, 0, (unsigned char *)"\x00\x00\x00\x00PS-Msg05", sessionKey)==-1){          
+      if(crypto_aead_chacha20poly1305_ietf_decrypt(decrypted, NULL, NULL, *itEncryptedData, itEncryptedData->getLen(), NULL, 0, (unsigned char *)"\x00\x00\x00\x00PS-Msg05", temp.sessionKey)==-1){          
         LOG0("\n*** ERROR: Exchange-Request Authentication Failed\n\n");
         responseTLV.add(kTLVType_Error,tagError_Authentication);        // set Error=Authentication
         tlvRespond(responseTLV);                                        // send response to client
@@ -489,11 +491,11 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
       // Note that the SALT and INFO text fields now match those in HAP Section 5.6.6.1
 
       TempBuffer<uint8_t> iosDeviceX(32);
-      hkdf.create(iosDeviceX,srp->K,64,"Pair-Setup-Controller-Sign-Salt","Pair-Setup-Controller-Sign-Info");     // derive iosDeviceX (32 bytes) from SRP Shared Secret using HKDF 
+      HKDF::create(iosDeviceX,srp->K,64,"Pair-Setup-Controller-Sign-Salt","Pair-Setup-Controller-Sign-Info");     // derive iosDeviceX (32 bytes) from SRP Shared Secret using HKDF 
 
       // Concatenate iosDeviceX, IOS ID, and IOS PublicKey into iosDeviceInfo
       
-      TempBuffer<uint8_t> iosDeviceInfo(iosDeviceX,iosDeviceX.len(),(*itIdentifier).val.get(),(*itIdentifier).len,(*itPublicKey).val.get(),(*itPublicKey).len,NULL);
+      TempBuffer<uint8_t> iosDeviceInfo(iosDeviceX,iosDeviceX.len(),(uint8_t *)(*itIdentifier),itIdentifier->getLen(),(uint8_t *)(*itPublicKey),itPublicKey->getLen(),NULL);
 
       if(crypto_sign_verify_detached(*itSignature, iosDeviceInfo, iosDeviceInfo.len(), *itPublicKey) != 0){      // verify signature of iosDeviceInfo using iosDeviceLTPK   
         LOG0("\n*** ERROR: LPTK Signature Verification Failed\n\n");
@@ -508,7 +510,7 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
       // Now perform the above steps in reverse to securely transmit the AccessoryLTPK to the Controller (HAP Section 5.6.6.2)
 
       TempBuffer<uint8_t> accessoryX(32);
-      hkdf.create(accessoryX,srp->K,64,"Pair-Setup-Accessory-Sign-Salt","Pair-Setup-Accessory-Sign-Info");       // derive accessoryX from SRP Shared Secret using HKDF 
+      HKDF::create(accessoryX,srp->K,64,"Pair-Setup-Accessory-Sign-Salt","Pair-Setup-Accessory-Sign-Info");       // derive accessoryX from SRP Shared Secret using HKDF 
       
       // Concatenate accessoryX, Accessory ID, and Accessory PublicKey into accessoryInfo
 
@@ -535,13 +537,14 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
 
       itEncryptedData=responseTLV.add(kTLVType_EncryptedData,subPack.len()+crypto_aead_chacha20poly1305_IETF_ABYTES,NULL);     //create blank EncryptedData TLV with space for subTLV + Authentication Tag
 
-      crypto_aead_chacha20poly1305_ietf_encrypt(*itEncryptedData,NULL,subPack,subPack.len(),NULL,0,NULL,(unsigned char *)"\x00\x00\x00\x00PS-Msg06",sessionKey);
+      crypto_aead_chacha20poly1305_ietf_encrypt(*itEncryptedData,NULL,subPack,subPack.len(),NULL,0,NULL,(unsigned char *)"\x00\x00\x00\x00PS-Msg06",temp.sessionKey);
                                                    
       LOG2("---------- END SUB-TLVS! ----------\n");
       
       tlvRespond(responseTLV);                              // send response to client
 
       delete srp;                                           // delete SRP - no longer needed once pairing is completed
+      srp=NULL;                                             // reset to NULL
 
       mdns_service_txt_item_set("_hap","_tcp","sf","0");    // broadcast new status
       
@@ -575,7 +578,7 @@ int HAPClient::postPairVerifyURL(uint8_t *content, size_t len){
     iosTLV.print();
   LOG2("------------ END TLVS! ------------\n");
 
-  LOG1("In Pair Verify #%d (%s)...",conNum,client.remoteIP().toString().c_str());
+  LOG1("In Pair Verify #%d (%s)...",clientNumber,client.remoteIP().toString().c_str());
   
   auto itState=iosTLV.find(kTLVType_State);
 
@@ -585,7 +588,7 @@ int HAPClient::postPairVerifyURL(uint8_t *content, size_t len){
     return(0);
   }
 
-  int tlvState=(*itState)[0];
+  int tlvState=itState->getVal();
 
   if(!nAdminControllers()){                             // error: Device not yet paired - we should not be receiving any requests for Pair-Verify!
     LOG0("\n*** ERROR: Device not yet paired!\n\n");
@@ -595,7 +598,7 @@ int HAPClient::postPairVerifyURL(uint8_t *content, size_t len){
     return(0);
   };
 
-  LOG2("Found <M%d>\n",tlvState);          // unlike pair-setup, out-of-sequencing can be handled gracefully for pair-verify (HAP requirement). No need to keep track of pairStatus
+  LOG1("Found <M%d>\n",tlvState);          // unlike pair-setup, out-of-sequencing can be handled gracefully for pair-verify (HAP requirement). No need to keep track of pairStatus
 
   switch(tlvState){                        // Pair-Verify STATE received -- process request!  (HAP Section 5.7)
 
@@ -611,16 +614,14 @@ int HAPClient::postPairVerifyURL(uint8_t *content, size_t len){
         return(0);        
       }
 
-      publicCurveKey=(uint8_t *)HS_MALLOC(crypto_box_PUBLICKEYBYTES);               // temporary space - will be deleted at end of verification process
       TempBuffer<uint8_t> secretCurveKey(crypto_box_SECRETKEYBYTES);                // temporary space - used only in this block     
-      crypto_box_keypair(publicCurveKey,secretCurveKey);                            // generate Accessory's random Curve25519 Public/Secret Key Pair
+      crypto_box_keypair(temp.publicCurveKey,secretCurveKey);                       // generate Accessory's random Curve25519 Public/Secret Key Pair
 
-      iosCurveKey=(uint8_t *)HS_MALLOC(crypto_box_PUBLICKEYBYTES);                  // temporary space - will be deleted at end of verification process
-      memcpy(iosCurveKey,*itPublicKey,crypto_box_PUBLICKEYBYTES);                   // save Controller's Curve25519 Public Key
+      memcpy(temp.iosCurveKey,*itPublicKey,crypto_box_PUBLICKEYBYTES);              // save Controller's Curve25519 Public Key
             
       // concatenate Accessory's Curve25519 Public Key, Accessory's Pairing ID, and Controller's Curve25519 Public Key into accessoryInfo
       
-      TempBuffer<uint8_t> accessoryInfo(publicCurveKey,crypto_box_PUBLICKEYBYTES,accessory.ID,hap_accessory_IDBYTES,iosCurveKey,crypto_box_PUBLICKEYBYTES,NULL);
+      TempBuffer<uint8_t> accessoryInfo(temp.publicCurveKey,crypto_box_PUBLICKEYBYTES,accessory.ID,hap_accessory_IDBYTES,temp.iosCurveKey,crypto_box_PUBLICKEYBYTES,NULL);
 
       subTLV.add(kTLVType_Identifier,hap_accessory_IDBYTES,accessory.ID);                         // set Identifier subTLV record as Accessory's Pairing ID
       auto itSignature=subTLV.add(kTLVType_Signature,crypto_sign_BYTES,NULL);                     // create blank Signature subTLV
@@ -634,19 +635,17 @@ int HAPClient::postPairVerifyURL(uint8_t *content, size_t len){
       TempBuffer<uint8_t> subPack(subTLV.pack_size());                                                    // create sub-TLV by packing Identifier and Signature TLV records together
       subTLV.pack(subPack);                                
 
-      sharedCurveKey=(uint8_t *)HS_MALLOC(crypto_box_PUBLICKEYBYTES);                                     // temporary space - will be deleted at end of verification process
-      crypto_scalarmult_curve25519(sharedCurveKey,secretCurveKey,iosCurveKey);                            // generate Shared-Secret Curve25519 Key from Accessory's Curve25519 Secret Key and Controller's Curve25519 Public Key
+      crypto_scalarmult_curve25519(temp.sharedCurveKey,secretCurveKey,temp.iosCurveKey);                  // generate Shared-Secret Curve25519 Key from Accessory's Curve25519 Secret Key and Controller's Curve25519 Public Key
 
-      sessionKey=(uint8_t *)HS_MALLOC(crypto_box_PUBLICKEYBYTES);                                                                // temporary space - will be deleted at end of verification process
-      hkdf.create(sessionKey,sharedCurveKey,crypto_box_PUBLICKEYBYTES,"Pair-Verify-Encrypt-Salt","Pair-Verify-Encrypt-Info");    // create Session Curve25519 Key from Shared-Secret Curve25519 Key using HKDF-SHA-512  
+      HKDF::create(temp.sessionKey,temp.sharedCurveKey,crypto_box_PUBLICKEYBYTES,"Pair-Verify-Encrypt-Salt","Pair-Verify-Encrypt-Info");   // create Session Curve25519 Key from Shared-Secret Curve25519 Key using HKDF-SHA-512  
 
-      auto itEncryptedData=responseTLV.add(kTLVType_EncryptedData,subPack.len()+crypto_aead_chacha20poly1305_IETF_ABYTES,NULL);                                    // create blank EncryptedData subTLV
-      crypto_aead_chacha20poly1305_ietf_encrypt(*itEncryptedData,NULL,subPack,subPack.len(),NULL,0,NULL,(unsigned char *)"\x00\x00\x00\x00PV-Msg02",sessionKey);   // encrypt data with Session Curve25519 Key and padded nonce="PV-Msg02"
+      auto itEncryptedData=responseTLV.add(kTLVType_EncryptedData,subPack.len()+crypto_aead_chacha20poly1305_IETF_ABYTES,NULL);                                         // create blank EncryptedData subTLV
+      crypto_aead_chacha20poly1305_ietf_encrypt(*itEncryptedData,NULL,subPack,subPack.len(),NULL,0,NULL,(unsigned char *)"\x00\x00\x00\x00PV-Msg02",temp.sessionKey);   // encrypt data with Session Curve25519 Key and padded nonce="PV-Msg02"
                                             
       LOG2("---------- END SUB-TLVS! ----------\n");
       
       responseTLV.add(kTLVType_State,pairState_M2);                                        // set State=<M2>
-      responseTLV.add(kTLVType_PublicKey,crypto_box_PUBLICKEYBYTES,publicCurveKey);        // set PublicKey to Accessory's Curve25519 Public Key
+      responseTLV.add(kTLVType_PublicKey,crypto_box_PUBLICKEYBYTES,temp.publicCurveKey);        // set PublicKey to Accessory's Curve25519 Public Key
     
       tlvRespond(responseTLV);                                      // send response to client  
     }
@@ -668,9 +667,9 @@ int HAPClient::postPairVerifyURL(uint8_t *content, size_t len){
 
       // use Session Curve25519 Key (from previous step) to decrypt encrypytedData TLV with padded nonce="PV-Msg03"
 
-      TempBuffer<uint8_t> decrypted((*itEncryptedData).len-crypto_aead_chacha20poly1305_IETF_ABYTES);        // temporary storage for decrypted data
+      TempBuffer<uint8_t> decrypted((*itEncryptedData).getLen()-crypto_aead_chacha20poly1305_IETF_ABYTES);        // temporary storage for decrypted data
       
-      if(crypto_aead_chacha20poly1305_ietf_decrypt(decrypted, NULL, NULL, *itEncryptedData, (*itEncryptedData).len, NULL, 0, (unsigned char *)"\x00\x00\x00\x00PV-Msg03", sessionKey)==-1){          
+      if(crypto_aead_chacha20poly1305_ietf_decrypt(decrypted, NULL, NULL, *itEncryptedData, itEncryptedData->getLen(), NULL, 0, (unsigned char *)"\x00\x00\x00\x00PV-Msg03", temp.sessionKey)==-1){          
         LOG0("\n*** ERROR: Verify Authentication Failed\n\n");
         responseTLV.add(kTLVType_State,pairState_M4);               // set State=<M4>
         responseTLV.add(kTLVType_Error,tagError_Authentication);    // set Error=Authentication
@@ -698,9 +697,9 @@ int HAPClient::postPairVerifyURL(uint8_t *content, size_t len){
       Controller *tPair;                                            // temporary pointer to Controller
       
       if(!(tPair=findController(*itIdentifier))){
-        LOG0("\n*** ERROR: Unrecognized Controller ID: ");
-        charPrintRow(*itIdentifier,hap_controller_IDBYTES,2);
-        LOG0("\n\n");
+        LOG1("\n*** WARNING: Unrecognized Controller ID: ");
+        charPrintRow(*itIdentifier,hap_controller_IDBYTES,1);
+        LOG1("\n\n");
         responseTLV.add(kTLVType_State,pairState_M4);               // set State=<M4>
         responseTLV.add(kTLVType_Error,tagError_Authentication);    // set Error=Authentication
         tlvRespond(responseTLV);                                    // send response to client
@@ -713,7 +712,7 @@ int HAPClient::postPairVerifyURL(uint8_t *content, size_t len){
 
       // concatenate Controller's Curve25519 Public Key (from previous step), Controller's Pairing ID, and Accessory's Curve25519 Public Key (from previous step) into iosDeviceInfo     
 
-      TempBuffer<uint8_t> iosDeviceInfo(iosCurveKey,crypto_box_PUBLICKEYBYTES,tPair->ID,hap_controller_IDBYTES,publicCurveKey,crypto_box_PUBLICKEYBYTES,NULL);
+      TempBuffer<uint8_t> iosDeviceInfo(temp.iosCurveKey,crypto_box_PUBLICKEYBYTES,tPair->ID,hap_controller_IDBYTES,temp.publicCurveKey,crypto_box_PUBLICKEYBYTES,NULL);
       
       if(crypto_sign_verify_detached(*itSignature, iosDeviceInfo, iosDeviceInfo.len(), tPair->LTPK) != 0){         // verify signature of iosDeviceInfo using Controller's LTPK   
         LOG0("\n*** ERROR: LPTK Signature Verification Failed\n\n");
@@ -728,16 +727,11 @@ int HAPClient::postPairVerifyURL(uint8_t *content, size_t len){
 
       cPair=tPair;        // save Controller for this connection slot - connection is now verified and should be encrypted going forward
 
-      hkdf.create(a2cKey,sharedCurveKey,32,"Control-Salt","Control-Read-Encryption-Key");        // create AccessoryToControllerKey from (previously-saved) Shared-Secret Curve25519 Key (HAP Section 6.5.2)
-      hkdf.create(c2aKey,sharedCurveKey,32,"Control-Salt","Control-Write-Encryption-Key");       // create ControllerToAccessoryKey from (previously-saved) Shared-Secret Curve25519 Key (HAP Section 6.5.2)
+      HKDF::create(a2cKey,temp.sharedCurveKey,32,"Control-Salt","Control-Read-Encryption-Key");        // create AccessoryToControllerKey from (previously-saved) Shared-Secret Curve25519 Key (HAP Section 6.5.2)
+      HKDF::create(c2aKey,temp.sharedCurveKey,32,"Control-Salt","Control-Write-Encryption-Key");       // create ControllerToAccessoryKey from (previously-saved) Shared-Secret Curve25519 Key (HAP Section 6.5.2)
       
       a2cNonce.zero();         // reset Nonces for this session to zero
       c2aNonce.zero();
-
-      free(publicCurveKey);     // free storage of these temporary variables created in previous step
-      free(sharedCurveKey);
-      free(sessionKey);
-      free(iosCurveKey);
 
       LOG2("\n*** SESSION VERIFICATION COMPLETE *** \n");
     }
@@ -766,12 +760,12 @@ int HAPClient::postPairingsURL(uint8_t *content, size_t len){
     iosTLV.print();
   LOG2("------------ END TLVS! ------------\n");
 
-  LOG1("In Post Pairings #%d (%s)...",conNum,client.remoteIP().toString().c_str());
+  LOG1("In Post Pairings #%d (%s)...",clientNumber,client.remoteIP().toString().c_str());
   
   auto itState=iosTLV.find(kTLVType_State);
   auto itMethod=iosTLV.find(kTLVType_Method);
     
-  if(iosTLV.len(itState)!=1 || (*itState)[0]!=1){               // missing STATE TLV
+  if(iosTLV.len(itState)!=1 || itState->getVal()!=1){           // missing STATE TLV
     LOG0("\n*** ERROR: Parirings 'State' is either missing or not set to <M1>\n\n");
     badRequestError();                                          // return with 400 error, which closes connection      
     return(0);
@@ -783,7 +777,7 @@ int HAPClient::postPairingsURL(uint8_t *content, size_t len){
     return(0);
   }
 
-  int tlvMethod=(*itMethod)[0];
+  int tlvMethod=itMethod->getVal();
 
   responseTLV.add(kTLVType_State,pairState_M2);                 // all responses include State=M2
   
@@ -810,7 +804,7 @@ int HAPClient::postPairingsURL(uint8_t *content, size_t len){
         return(0);
       } 
              
-      tagError err=addController(*itIdentifier,*itPublicKey,(*itPermissions)[0]);
+      tagError err=addController(*itIdentifier,*itPublicKey,itPermissions->getVal());
       if(err!=tagError_None)
         responseTLV.add(kTLVType_Error,err);
       
@@ -892,7 +886,7 @@ int HAPClient::getAccessoriesURL(){
     return(0);
   }
 
-  LOG1("In Get Accessories #%d (%s)...\n",conNum,client.remoteIP().toString().c_str());
+  LOG1("In Get Accessories #%d (%s)...\n",clientNumber,client.remoteIP().toString().c_str());
 
   homeSpan.printfAttributes();
   size_t nBytes=hapOut.getSize();
@@ -920,7 +914,10 @@ int HAPClient::getCharacteristicsURL(char *urlBuf){
     return(0);
   }
 
-  LOG1("In Get Characteristics #%d (%s)...\n",conNum,client.remoteIP().toString().c_str());
+  LOG1("In Get Characteristics #%d (%s)...\n",clientNumber,client.remoteIP().toString().c_str());
+
+  if(homeSpan.getCharacteristicsCallback)
+    homeSpan.getCharacteristicsCallback(urlBuf);
 
   int len=strlen(urlBuf);           // determine number of IDs specified by counting commas in URL
   int numIDs=1;
@@ -965,6 +962,8 @@ int HAPClient::getCharacteristicsURL(char *urlBuf){
   if(!numIDs)           // could not find any IDs
     return(0);
 
+  LOG2("\n>>>>>>>>>> %s >>>>>>>>>>\n",client.remoteIP().toString().c_str());
+
   boolean statusFlag=homeSpan.printfAttributes(ids,numIDs,flags);     // get statusFlag returned to use below
   size_t nBytes=hapOut.getSize();
   hapOut.flush();
@@ -988,20 +987,17 @@ int HAPClient::putCharacteristicsURL(char *json){
     return(0);
   }
 
-  LOG1("In Put Characteristics #%d (%s)...\n",conNum,client.remoteIP().toString().c_str());
+  LOG1("In Put Characteristics #%d (%s)...\n",clientNumber,client.remoteIP().toString().c_str());
 
-  int n=homeSpan.countCharacteristics(json);    // count number of objects in JSON request
-  if(n==0)                                      // if no objects found, return
-    return(0);
- 
-  SpanBuf pObj[n];                                        // reserve space for objects
-  if(!homeSpan.updateCharacteristics(json, pObj))         // perform update
+  SpanBufVec pVec;
+   
+  if(!homeSpan.updateCharacteristics(json, pVec))         // perform update and check for success
     return(0);                                            // return if failed to update (error message will have been printed in update)
 
-  int multiCast=0;                                        // check if all status is OK, or if multicast response is request
-  for(int i=0;i<n;i++)
-    if(pObj[i].status!=StatusCode::OK)
-      multiCast=1;    
+  boolean multiCast=false;
+  for(auto it=pVec.begin();it!=pVec.end() && !multiCast;it++)   // for each characteristic, check if any status is either NOT OKAY, or if WRITE-RESPONSE is requested
+    if((*it).status!=StatusCode::OK || (*it).wr)                // if so, must use multicast response
+      multiCast=true;    
 
   LOG2("\n>>>>>>>>>> %s >>>>>>>>>>\n",client.remoteIP().toString().c_str());
 
@@ -1011,15 +1007,15 @@ int HAPClient::putCharacteristicsURL(char *json){
     hapOut << "HTTP/1.1 204 No Content\r\n\r\n";
     hapOut.flush();
         
-  } else {                                                // multicast respose is required
+  } else {                                                // multicast response is required
 
-    homeSpan.printfAttributes(pObj,n);
+    homeSpan.printfAttributes(pVec);
     size_t nBytes=hapOut.getSize();
     hapOut.flush();
   
     hapOut.setLogLevel(2).setHapClient(this);
     hapOut << "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/hap+json\r\nContent-Length: " << nBytes << "\r\n\r\n";
-    homeSpan.printfAttributes(pObj,n);
+    homeSpan.printfAttributes(pVec);
     hapOut.flush(); 
   }
 
@@ -1027,7 +1023,7 @@ int HAPClient::putCharacteristicsURL(char *json){
 
   // Create and send Event Notifications if needed
 
-  eventNotify(pObj,n,HAPClient::conNum);                  // transmit EVENT Notification for "n" pObj objects, except DO NOT notify client making request
+  eventNotify(pVec,this);                                 // transmit EVENT Notification for objects, except DO NOT notify client making request
     
   return(1);
 }
@@ -1041,17 +1037,17 @@ int HAPClient::putPrepareURL(char *json){
     return(0);
   }
 
-  LOG1("In Put Prepare #%d (%s)...\n",conNum,client.remoteIP().toString().c_str());
+  LOG1("In Put Prepare #%d (%s)...\n",clientNumber,client.remoteIP().toString().c_str());
 
   char ttlToken[]="\"ttl\":";
   char pidToken[]="\"pid\":";
   
   char *cBuf;
-  uint32_t ttl;
-  uint64_t pid;
+  uint32_t ttl=0;
+  uint64_t pid=0;
    
   if((cBuf=strstr(json,ttlToken)))
-    sscanf(cBuf+strlen(ttlToken),"%u",&ttl);
+    sscanf(cBuf+strlen(ttlToken),"%lu",&ttl);
 
   if((cBuf=strstr(json,pidToken)))
     sscanf(cBuf+strlen(ttlToken),"%llu",&pid);
@@ -1082,8 +1078,10 @@ int HAPClient::putPrepareURL(char *json){
 
 //////////////////////////////////////
 
-void HAPClient::getStatusURL(HAPClient *hapClient, void (*callBack)(const char *, void *), void *user_data){
-  
+void HAPClient::getStatusURL(HAPClient *hapClient, void (*callBack)(const char *, void *), void *user_data, int refreshTime){
+
+  std::shared_lock readLock(homeSpan.webLog.mux);        // wait for mux to be unlocked, or already locked non-exclusively, and then lock *non-exclusively* to prevent writing in vLog
+
   char clocktime[33];
 
   if(homeSpan.webLog.timeInit){
@@ -1108,10 +1106,18 @@ void HAPClient::getStatusURL(HAPClient *hapClient, void (*callBack)(const char *
     
   hapOut.setHapClient(hapClient).setLogLevel(2).setCallback(callBack).setCallbackUserData(user_data);
 
-  if(!callBack)
-    hapOut << "HTTP/1.1 200 OK\r\nContent-type: text/html; charset=utf-8\r\n\r\n";
+  if(!callBack){
+    hapOut << "HTTP/1.1 200 OK\r\nContent-type: text/html; charset=utf-8\r\n";
+    if(refreshTime>0)
+      hapOut << "Refresh: " << refreshTime << "\r\n";
+    hapOut << "\r\n";
+  }
     
   hapOut << "<html><head><title>" << homeSpan.displayName << "</title>\n";
+
+  if(homeSpan.webLog.faviconURL)
+    hapOut << "<link rel=\"icon\" href=\"" << homeSpan.webLog.faviconURL << "\" type=\"image/png\" />\n";
+    
   hapOut << "<style>body {background-color:lightblue;} th, td {padding-right: 10px; padding-left: 10px; border:1px solid black;}" << homeSpan.webLog.css.c_str() << "</style></head>\n";
   hapOut << "<body class=bod1><h2>" << homeSpan.displayName << "</h2>\n";
   
@@ -1119,51 +1125,28 @@ void HAPClient::getStatusURL(HAPClient *hapClient, void (*callBack)(const char *
   hapOut << "<tr><td>Up Time:</td><td>" << uptime << "</td></tr>\n";
   hapOut << "<tr><td>Current Time:</td><td>" << clocktime << "</td></tr>\n";
   hapOut << "<tr><td>Boot Time:</td><td>" << homeSpan.webLog.bootTime << "</td></tr>\n"; 
-  hapOut << "<tr><td>Reset Reason:</td><td>";
-  
-  switch(esp_reset_reason()) {
-    case ESP_RST_UNKNOWN:
-      hapOut << "Cannot be determined";
-      break;
-    case ESP_RST_POWERON:
-      hapOut << "Power-on event";
-      break;
-    case ESP_RST_EXT:
-      hapOut << "External pin";
-      break;
-    case ESP_RST_SW:
-      hapOut << "Software reboot via esp_restart";
-      break;
-    case ESP_RST_PANIC:
-      hapOut << "Software Exception/Panic";
-      break;
-    case ESP_RST_INT_WDT:
-      hapOut << "Interrupt watchdog";
-      break;
-    case ESP_RST_TASK_WDT:
-      hapOut << "Task watchdog";
-      break;
-    case ESP_RST_WDT:
-      hapOut << "Other watchdogs";
-      break;
-    case ESP_RST_DEEPSLEEP:
-      hapOut << "Exiting deep sleep mode";
-      break;
-    case ESP_RST_BROWNOUT:
-      hapOut << "Brownout";
-      break;
-    case ESP_RST_SDIO:
-      hapOut << "SDIO";
-      break;
-    default:
-      hapOut << "Unknown Reset Code";
+  hapOut << "<tr><td>Reset Reason:</td><td>" << Utils::resetReason() << " (" << esp_reset_reason() << ")</td></tr>\n";
+
+  if(homeSpan.compileTime)
+    hapOut << "<tr><td>Compile Time:</td><td>" << homeSpan.compileTime << "</td></tr>\n";
+
+  if(!homeSpan.ethernetEnabled){
+    hapOut << "<tr><td>WiFi Disconnects:</td><td>" << homeSpan.connected/2 << "</td></tr>\n";
+    hapOut << "<tr><td>WiFi Signal:</td><td>" << (int)WiFi.RSSI() << " dBm</td></tr>\n";
+    if(homeSpan.bssidNames.count(WiFi.BSSIDstr().c_str()))
+      hapOut << "<tr><td>BSSID:</td><td>" << WiFi.BSSIDstr().c_str() << " \"" << homeSpan.bssidNames[WiFi.BSSIDstr().c_str()].c_str() << "\"" << "</td></tr>\n";
+    else
+      hapOut << "<tr><td>BSSID:</td><td>" << WiFi.BSSIDstr().c_str() << "</td></tr>\n";
+    hapOut << "<tr><td>WiFi Local IPv4:</td><td>" << WiFi.localIP().toString().c_str() << "</td></tr>\n";
+    hapOut << "<tr><td>WiFi Local IPv6:</td><td>" << homeSpan.getUniqueLocalIPv6(WiFi).toString().c_str() << "</td></tr>\n";
+    hapOut << "<tr><td>WiFi Gateway:</td><td>" << WiFi.gatewayIP().toString().c_str() << "</td></tr>\n";
+  } else {
+    hapOut << "<tr><td>Ethernet Disconnects:</td><td>" << homeSpan.connected/2 << "</td></tr>\n";
+    hapOut << "<tr><td>Ethernet Local IPv4:</td><td>" << ETH.localIP().toString().c_str() << "</td></tr>\n";    
+    hapOut << "<tr><td>Ethernet Local IPv6:</td><td>" << homeSpan.getUniqueLocalIPv6(ETH).toString().c_str() << "</td></tr>\n";
+    hapOut << "<tr><td>Ethernet Gateway:</td><td>" << ETH.gatewayIP().toString().c_str() << "</td></tr>\n";    
   }
   
-  hapOut << " (" << esp_reset_reason() << ")</td></tr>\n";
-  
-  hapOut << "<tr><td>WiFi Disconnects:</td><td>" << homeSpan.connected/2 << "</td></tr>\n";
-  hapOut << "<tr><td>WiFi Signal:</td><td>" << (int)WiFi.RSSI() << " dBm</td></tr>\n";
-  hapOut << "<tr><td>WiFi Gateway:</td><td>" << WiFi.gatewayIP().toString().c_str() << "</td></tr>\n";
   hapOut << "<tr><td>ESP32 Board:</td><td>" << ARDUINO_BOARD << "</td></tr>\n";
   hapOut << "<tr><td>Arduino-ESP Version:</td><td>" << ARDUINO_ESP_VERSION << "</td></tr>\n";
   hapOut << "<tr><td>ESP-IDF Version:</td><td>" << ESP_IDF_VERSION_MAJOR << "." << ESP_IDF_VERSION_MINOR << "." << ESP_IDF_VERSION_PATCH << "</td></tr>\n";
@@ -1217,6 +1200,7 @@ void HAPClient::getStatusURL(HAPClient *hapClient, void (*callBack)(const char *
 
   if(hapClient){
     hapClient->client.stop();
+    delay(1);
     LOG2("------------ SENT! --------------\n");
   }
 }
@@ -1225,9 +1209,9 @@ void HAPClient::getStatusURL(HAPClient *hapClient, void (*callBack)(const char *
 
 void HAPClient::checkNotifications(){
 
-  if(!homeSpan.Notifications.empty()){                                          // if there are Notifications to process    
-    eventNotify(&homeSpan.Notifications[0],homeSpan.Notifications.size());      // transmit EVENT Notifications
-    homeSpan.Notifications.clear();                                             // clear Notifications vector
+  if(!homeSpan.Notifications.empty()){       // if there are Notifications to process    
+    eventNotify(homeSpan.Notifications);     // transmit EVENT Notifications
+    homeSpan.Notifications.clear();          // clear Notifications vector
   }
 }
 
@@ -1240,33 +1224,32 @@ void HAPClient::checkTimedWrites(){
   auto tw=homeSpan.TimedWrites.begin();
   while(tw!=homeSpan.TimedWrites.end()){
     if(cTime>tw->second){                                             // timer has expired
-       LOG2("Removing PID=%llu  ALARM=%u\n",tw->first,tw->second);
+       LOG2("Removing PID=%llu  ALARM=%lu\n",tw->first,tw->second);
        tw=homeSpan.TimedWrites.erase(tw);
       }
     else
       tw++; 
   }
- 
 }
 
 //////////////////////////////////////
 
-void HAPClient::eventNotify(SpanBuf *pObj, int nObj, int ignoreClient){
-  
-  for(int cNum=0;cNum<homeSpan.maxConnections;cNum++){      // loop over all connection slots
-    if(hap[cNum]->client && cNum!=ignoreClient){            // if there is a client connected to this slot and it is NOT flagged to be ignored (in cases where it is the client making a PUT request)
+void HAPClient::eventNotify(SpanBufVec &pVec, HAPClient *ignore){
 
-      homeSpan.printfNotify(pObj,nObj,cNum);                // create JSON (which may be of zero length if there are no applicable notifications for this cNum)
+  for(auto it=homeSpan.hapList.begin(); it!=homeSpan.hapList.end(); ++it){          // loop over all connection slots
+    if(&(*it)!=ignore){                                                             // if NOT flagged to be ignored (in cases where it is the client making a PUT request)
+
+      homeSpan.printfNotify(pVec,&(*it));              // create JSON (which may be of zero length if there are no applicable notifications for this cNum)
       size_t nBytes=hapOut.getSize();
       hapOut.flush();
 
-      if(nBytes>0){                                         // if there ARE notifications to send to client cNum
+      if(nBytes>0){                                    // if there ARE notifications to send to client cNum
         
-        LOG2("\n>>>>>>>>>> %s >>>>>>>>>>\n",hap[cNum]->client.remoteIP().toString().c_str());
+        LOG2("\n>>>>>>>>>> %s >>>>>>>>>>\n",it->client.remoteIP().toString().c_str());
 
-        hapOut.setLogLevel(2).setHapClient(hap[cNum]);    
+        hapOut.setLogLevel(2).setHapClient(&(*it));    
         hapOut << "EVENT/1.0 200 OK\r\nContent-Type: application/hap+json\r\nContent-Length: " << nBytes << "\r\n\r\n";
-        homeSpan.printfNotify(pObj,nObj,cNum);
+        homeSpan.printfNotify(pVec,&(*it));
         hapOut.flush();
 
         LOG2("\n-------- SENT ENCRYPTED! --------\n");
@@ -1301,6 +1284,8 @@ void HAPClient::tlvRespond(TLV8 &tlv8){
     LOG2("------------ SENT! --------------\n");
   else
     LOG2("-------- SENT ENCRYPTED! --------\n");
+
+  free(body);
   
 } // tlvRespond
 
@@ -1345,7 +1330,7 @@ int HAPClient::receiveEncrypted(uint8_t *httpBuf, int messageSize){
 /////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////
 
-void HAPClient::hexPrintColumn(uint8_t *buf, int n, int minLogLevel){
+void HAPClient::hexPrintColumn(const uint8_t *buf, int n, int minLogLevel){
 
   if(homeSpan.logLevel<minLogLevel)
     return;
@@ -1356,7 +1341,7 @@ void HAPClient::hexPrintColumn(uint8_t *buf, int n, int minLogLevel){
 
 //////////////////////////////////////
 
-void HAPClient::hexPrintRow(uint8_t *buf, int n, int minLogLevel){
+void HAPClient::hexPrintRow(const uint8_t *buf, int n, int minLogLevel){
 
   if(homeSpan.logLevel<minLogLevel)
     return;
@@ -1367,7 +1352,7 @@ void HAPClient::hexPrintRow(uint8_t *buf, int n, int minLogLevel){
 
 //////////////////////////////////////
 
-void HAPClient::charPrintRow(uint8_t *buf, int n, int minLogLevel){
+void HAPClient::charPrintRow(const uint8_t *buf, int n, int minLogLevel){
 
   if(homeSpan.logLevel<minLogLevel)
     return;
@@ -1469,11 +1454,11 @@ void HAPClient::removeController(uint8_t *id){
 //////////////////////////////////////
 
 void HAPClient::tearDown(uint8_t *id){
-  
-  for(int i=0;i<homeSpan.maxConnections;i++){     // loop over all connection slots
-    if(hap[i]->client && (id==NULL || (hap[i]->cPair && !memcmp(id,hap[i]->cPair->ID,hap_controller_IDBYTES)))){
-      LOG1("*** Terminating Client #%d\n",i);
-      hap[i]->client.stop();
+
+  for(HAPClient &hc : homeSpan.hapList){
+    if(id==NULL || (hc.cPair && !memcmp(id,hc.cPair->ID,hap_controller_IDBYTES))){
+      LOG1("*** Terminating Client #%d\n",hc.clientNumber);
+      hc.client.stop();
     }
   }
 }
@@ -1503,16 +1488,19 @@ void HAPClient::printControllers(int minLogLevel){
 
 void HAPClient::saveControllers(){
 
+  if(homeSpan.controllerCallback)
+    homeSpan.controllerCallback();
+
   if(controllerList.empty()){
-    nvs_erase_key(hapNVS,"CONTROLLERS");
+    nvs_erase_key(homeSpan.hapNVS,"CONTROLLERS");
     return;
   }
 
   TempBuffer<Controller> tBuf(controllerList.size());                    // create temporary buffer to hold Controller data
-  std::copy(controllerList.begin(),controllerList.end(),tBuf.get());      // copy data from linked list to buffer
+  std::copy(controllerList.begin(),controllerList.end(),tBuf.get());     // copy data from linked list to buffer
   
-  nvs_set_blob(hapNVS,"CONTROLLERS",tBuf,tBuf.len());      // update data
-  nvs_commit(hapNVS);                                            // commit to NVS  
+  nvs_set_blob(homeSpan.hapNVS,"CONTROLLERS",tBuf,tBuf.len());           // update data
+  nvs_commit(homeSpan.hapNVS);                                           // commit to NVS  
 }
 
 
@@ -1558,7 +1546,7 @@ HapOut::HapStreamBuffer::HapStreamBuffer(){
   ctx = (mbedtls_sha512_context *)heap_caps_malloc(sizeof(mbedtls_sha512_context),caps);    // space for hash context
   
   mbedtls_sha512_init(ctx);                 // initialize context
-  mbedtls_sha512_starts_ret(ctx,1);         // start SHA-384 hash (note second argument=1)
+  mbedtls_sha512_starts(ctx,1);             // start SHA-384 hash (note second argument=1)
   
   setp(buffer, buffer+bufSize-1);           // assign buffer pointers
 }
@@ -1566,9 +1554,12 @@ HapOut::HapStreamBuffer::HapStreamBuffer(){
 //////////////////////////////////////
 
 HapOut::HapStreamBuffer::~HapStreamBuffer(){
-  
+
   sync();
   free(buffer);
+  free(encBuf);
+  free(hash);
+  free(ctx);
 }
 
 //////////////////////////////////////
@@ -1607,7 +1598,7 @@ void HapOut::HapStreamBuffer::flushBuffer(){
     delay(1);
   }
 
-  mbedtls_sha512_update_ret(ctx,(uint8_t *)buffer,num);   // update hash
+  mbedtls_sha512_update(ctx,(uint8_t *)buffer,num);       // update hash
 
   pbump(-num);                                            // reset buffer pointers
 }
@@ -1643,8 +1634,8 @@ int HapOut::HapStreamBuffer::sync(){
     callBackUserData=NULL;
   }
 
-  mbedtls_sha512_finish_ret(ctx,hash);    // finish SHA-384 and store hash
-  mbedtls_sha512_starts_ret(ctx,1);       // re-start hash for next time
+  mbedtls_sha512_finish(ctx,hash);    // finish SHA-384 and store hash
+  mbedtls_sha512_starts(ctx,1);       // re-start hash for next time
 
   return(0);
 }
@@ -1690,12 +1681,7 @@ void HapOut::HapStreamBuffer::printFormatted(char *buf, size_t nChars, size_t ns
 
 // instantiate all static HAP Client structures and data
 
-nvs_handle HAPClient::hapNVS;
-nvs_handle HAPClient::srpNVS;
-HKDF HAPClient::hkdf;                                   
 pairState HAPClient::pairStatus;                        
 Accessory HAPClient::accessory;                         
 list<Controller, Mallocator<Controller>> HAPClient::controllerList;
-SRP6A *HAPClient::srp=NULL;
-int HAPClient::conNum;
  

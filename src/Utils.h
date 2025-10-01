@@ -1,7 +1,7 @@
 /*********************************************************************************
  *  MIT License
  *  
- *  Copyright (c) 2020-2024 Gregg E. Berman
+ *  Copyright (c) 2020-2025 Gregg E. Berman
  *  
  *  https://github.com/HomeSpan/HomeSpan
  *  
@@ -28,14 +28,18 @@
 #pragma once
 
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 
 #include "PSRAM.h"
+
+[[maybe_unused]] static const char* WATCHDOG_TAG = "HomeSpan Watchdog";
 
 namespace Utils {
 
 char *readSerial(char *c, int max);   // read serial port into 'c' until <newline>, but storing only first 'max' characters (the rest are discarded)
 String mask(char *c, int n);          // simply utility that creates a String from 'c' with all except the first and last 'n' characters replaced by '*'
-  
+char *stripBackslash(char *c);        // strips backslashes out of c (Apple unecessesarily "escapes" forward slashes in JSON)
+const char *resetReason();            // returns literal string description of esp_reset_reason()
 }
 
 /////////////////////////////////////////////////
@@ -111,15 +115,11 @@ class PushButton{
   uint32_t singleAlarm;
   uint32_t doubleAlarm;
   uint32_t longAlarm;
-
-#if SOC_TOUCH_VERSION_2
-  typedef uint32_t touch_value_t;
-#else
-  typedef uint16_t touch_value_t;
-#endif  
   
+#if SOC_TOUCH_SENSOR_SUPPORTED
   static touch_value_t threshold;
   static const int calibCount=20;
+#endif
 
   public:
 
@@ -144,12 +144,10 @@ class PushButton{
   static boolean TRIGGER_ON_LOW(int pin){return(!digitalRead(pin));}
   static boolean TRIGGER_ON_HIGH(int pin){return(digitalRead(pin));}
 
-#if SOC_TOUCH_SENSOR_NUM > 0
-#if SOC_TOUCH_VERSION_2
-  static boolean TRIGGER_ON_TOUCH(int pin){return(touchRead(pin)>threshold);}
-#else
+#if SOC_TOUCH_SENSOR_VERSION==1
   static boolean TRIGGER_ON_TOUCH(int pin){return(touchRead(pin)<threshold);}
-#endif
+#elif SOC_TOUCH_SENSOR_VERSION==2
+  static boolean TRIGGER_ON_TOUCH(int pin){return(touchRead(pin)>threshold);}
 #endif
 
   PushButton(int pin, triggerType_t triggerType=TRIGGER_ON_LOW);
@@ -216,14 +214,7 @@ class PushButton{
 
 //  Returns pin number
 
-#if SOC_TOUCH_SENSOR_NUM > 0
-
-  static void setTouchCycles(uint16_t measureTime, uint16_t sleepTime){touchSetCycles(measureTime,sleepTime);}
-  
-//  Sets the measure time and sleep time touch cycles , and lower threshold that triggers a touch - used only when triggerType=PushButton::TRIGGER_ON_TOUCH
-
-//    measureTime:  duration of measurement time of all touch sensors in number of clock cycles
-//    sleepTime:    duration of sleep time (between measurements) of all touch sensors number of clock cycles
+#if SOC_TOUCH_SENSOR_SUPPORTED
 
   static void setTouchThreshold(touch_value_t thresh){threshold=thresh;}
 
@@ -234,4 +225,22 @@ class PushButton{
 
 #endif
 
+};
+
+////////////////////////////////
+//      hsWatchdogTimer       //
+////////////////////////////////
+
+class hsWatchdogTimer {
+
+  uint16_t nSeconds=0;
+  esp_task_wdt_user_handle_t wdtHandle=NULL;
+
+  public:
+
+  hsWatchdogTimer(){};
+  void enable(uint16_t nSeconds);
+  void disable();
+  void reset();
+  uint16_t getSeconds();
 };
